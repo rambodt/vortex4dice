@@ -338,7 +338,7 @@ module active_cta_table #(
             // Check that add_cta_size matches the product of dimensions
             calculated_size = add_cta_size_x * add_cta_size_y * add_cta_size_z;
             if (calculated_size != add_cta_size) begin
-                $warning("CTA size mismatch: %0d (input) vs %0d (calculated_size calculated from %0d×%0d×%0d)", 
+                $warning("CTA size mismatch: %0d (input) vs %0d (calculated_size calculated from %0dx%0dx%0d)", 
                         add_cta_size, calculated_size, add_cta_size_x, add_cta_size_y, add_cta_size_z);
             end
             
