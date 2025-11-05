@@ -1,294 +1,261 @@
-// ============================================================================
-// CTA Dispatcher (Single-Kernel)
-//  - Dispatcher owns residency credits (slots + SMEM) per SM
-//  - One kernel active at a time
-//  - 1->N CTA grant bus with full context (includes pre-decoded ctaid{x,y,z})
-//  - N->1 completion arbiter to return credits
-//  - Round-robin among eligible SMs
-// ============================================================================
+`include "dice_define.vh"
 
-package cta_dispatch_pkg;
-  // Parameterizable widths are expected to be consistent across design.
-  // You can import this package wherever you instantiate the dispatcher.
-endpackage : cta_dispatch_pkg
-
-//------------------------------------------------------------------------------
-// Type definitions (place in a shared package if preferred)
-//------------------------------------------------------------------------------
-typedef struct packed {
-  logic [63:0] start_pc;    // kernel entry PC
-  logic [63:0] arg_ptr;     // pointer to kernel argument block
-} kernel_exec_info_t;
-
-// Full launch descriptor provided by host/driver for ONE kernel
-typedef struct packed {
-  // IDs and geometry
-  logic [ 7:0]                 kernel_id;       // KID_W defaulted to 8 below
-  logic [15:0]                 grid_x;          // CTA_ID_WIDTH default 16
-  logic [15:0]                 grid_y;
-  logic [15:0]                 grid_z;
-  logic [10:0]                 block_x;         // TID_WIDTH default 11
-  logic [10:0]                 block_y;
-  logic [10:0]                 block_z;
-
-  // Resources
-  logic [17:0]                 smem_per_cta;    // SMEM_W default 18 (bytes)
-  logic [ 3:0]                 max_cta_per_sm;  // SLOTS_W default 4
-  logic [17:0]                 smem_per_sm;     // total SMEM per SM (bytes)
-
-  // Execution
-  kernel_exec_info_t           exec;
-} launch_desc_t;
-
-// CTA context sent with each grant
-typedef struct packed {
-  // Identity
-  logic [ 7:0]                 kernel_id;
-  logic [19:0]                 cta_idx;         // CTA_IDX_W default 20
-
-  // Geometry (dims and decoded 3D CTA IDs)
-  logic [15:0]                 grid_x, grid_y, grid_z;
-  logic [10:0]                 block_x, block_y, block_z;
-  logic [15:0]                 ctaid_x, ctaid_y, ctaid_z;
-
-  // Resources / execution
-  logic [17:0]                 smem_size;
-  logic [63:0]                 start_pc;
-  logic [63:0]                 arg_ptr;
-} cta_context_t;
-
-//------------------------------------------------------------------------------
-// Dispatcher
-//------------------------------------------------------------------------------
 module cta_dispatcher #(
-  // Fabric parameters
-  parameter int unsigned N_SM          = 8,
-
-  // Widths (match typedef defaults above if you change them)
-  parameter int unsigned KID_W         = 8,
-  parameter int unsigned CTA_IDX_W     = 20,
-  parameter int unsigned CTA_ID_WIDTH  = 16,
-  parameter int unsigned TID_WIDTH     = 11,
-  parameter int unsigned SMEM_W        = 18,
-  parameter int unsigned SLOTS_W       = 4
+  parameter int unsigned N_CORES = `DICE_NUM_CGRA_CORES
 )(
-  input  logic                         clk,
-  input  logic                         rst_n,
+  input  logic                        clk,
+  input  logic                        rst_n,
 
-  // ---------------- Host Launch (single kernel) ----------------
-  input  logic                         launch_valid,
-  output logic                         launch_ready,
-  input  launch_desc_t                 launch_desc,
+  // ---------------- Host Launch ----------------
+  input  logic                        launch_valid,
+  output logic                        launch_ready,
+  input  dice_pkg::dice_kernel_desc_t launch_desc,
 
-  // ---------------- Dispatcher -> SM Grants (1 -> N) ----------
-  output logic        [N_SM-1:0]       sm_grant_valid,
-  input  logic        [N_SM-1:0]       sm_grant_ready,
-  output cta_context_t [N_SM-1:0]      sm_grant_ctx,
+  // ---------------- Dispatcher -> Core Grants ----------------
+  output logic              [N_CORES-1:0]          sm_grant_valid,
+  input  logic              [N_CORES-1:0]          sm_grant_ready,
+  output dice_pkg::dice_cta_desc_t    sm_grant_ctx     [N_CORES],
 
-  // ---------------- SM -> Dispatcher Done (N -> 1) -------------
-  input  logic        [N_SM-1:0]       sm_done_valid,
-  output logic        [N_SM-1:0]       sm_done_ready,
-  input  logic [N_SM-1:0][KID_W-1:0]   sm_done_kernel_id,
-  input  logic [N_SM-1:0][CTA_IDX_W-1:0] sm_done_cta_idx,
-  input  logic [N_SM-1:0][SMEM_W-1:0]  sm_done_smem_release
-
-  // (Optional) add status outputs like kernel_done if you want a pulse
+  // ---------------- Core -> Dispatcher Done ------------------
+  input  logic              [N_CORES-1:0]          sm_done_valid,
+  output logic              [N_CORES-1:0]          sm_done_ready,
+  input  dice_pkg::dice_cta_id_t      sm_done_cta_id   [N_CORES]
 );
 
-  // ---------------- Internal kernel state ----------------
-  logic                 kernel_active;
-  launch_desc_t         kdesc_q;
-  logic [CTA_IDX_W-1:0] next_cta_q;
-  logic [CTA_IDX_W-1:0] ctas_rem_q;
+  import dice_pkg::*;
 
-  // Per-SM residency mirrors (source of truth for eligibility)
-  logic [N_SM-1:0][SLOTS_W-1:0] sm_active_cta_q;
-  logic [N_SM-1:0][SMEM_W-1:0]  sm_smem_used_q;
+  // --------------------------------------------------------------------
+  // Parameters for credit tracking
+  // --------------------------------------------------------------------
+  localparam int unsigned MAX_CREDITS = `DICE_NUM_MAX_CTA_PER_CORE;
+  localparam int unsigned CREDIT_W    = $clog2(MAX_CREDITS + 1);
 
-  // ---------------- Helpers ----------------
-  // Total CTA count = grid_x * grid_y * grid_z
-  function automatic [CTA_IDX_W-1:0] calc_cta_count(input launch_desc_t d);
-    calc_cta_count = d.grid_x * d.grid_y * d.grid_z;
-  endfunction
+  // --------------------------------------------------------------------
+  // Internal kernel state
+  // --------------------------------------------------------------------
+  logic                    kernel_active;
+  dice_kernel_desc_t       kdesc_q;
 
-  // Linear -> 3D decode:
-  //   x = idx % grid_x
-  //   y = (idx / grid_x) % grid_y
-  //   z = idx / (grid_x * grid_y)
-  function automatic void decode_cta_id(
-    input  logic [CTA_IDX_W-1:0]   idx,
-    input  logic [CTA_ID_WIDTH-1:0] gx,
-    input  logic [CTA_ID_WIDTH-1:0] gy,
-    output logic [CTA_ID_WIDTH-1:0] id_x,
-    output logic [CTA_ID_WIDTH-1:0] id_y,
-    output logic [CTA_ID_WIDTH-1:0] id_z
-  );
-    logic [CTA_IDX_W-1:0] q, r;
-    r   = idx % gx;
-    q   = idx / gx;
-    id_x = r[CTA_ID_WIDTH-1:0];
+  // 3D counters for next CTA
+  logic [DICE_CTA_ID_WIDTH-1:0] cta_x_q, cta_y_q, cta_z_q;
+  logic                         issued_all_q;
 
-    r   = q % gy;
-    id_y = r[CTA_ID_WIDTH-1:0];
+  // Per-core credits: # of free CTA slots remaining on each core
+  logic [CREDIT_W-1:0] credit_q [N_CORES];
 
-    q   = q / gy;
-    id_z = q[CTA_ID_WIDTH-1:0];
-  endfunction
+  // Total outstanding CTAs across all cores (for quick kernel-drain check)
+  logic [$clog2(1<<16)-1:0] outstanding_q;  // big enough for your grids
 
-  // ---------------- Launch handshake ----------------
+  // Round-robin pointers
+  logic [$clog2(N_CORES)-1:0] rr_ptr_q, rr_ptr_d;
+  logic [$clog2(N_CORES)-1:0] done_rr_ptr_q, done_rr_ptr_d;
+
+  // --------------------------------------------------------------------
+  // Launch handshake
+  // --------------------------------------------------------------------
   assign launch_ready = !kernel_active;
 
-  // ---------------- Round-robin pointers ----------------
-  logic [$clog2(N_SM)-1:0] rr_ptr_q, rr_ptr_d;          // for dispatch
-  logic [$clog2(N_SM)-1:0] done_rr_ptr_q, done_rr_ptr_d;// for completion
-
-  // ---------------- Eligibility check (internal credits only) ------
-  function automatic logic sm_eligible(
-    input int unsigned                 smi,
-    input launch_desc_t                kd,
-    input logic [SLOTS_W-1:0]          active_slots,
-    input logic [SMEM_W-1:0]           smem_used
+  // --------------------------------------------------------------------
+  // CTA enumeration
+  // --------------------------------------------------------------------
+  function automatic void next_cta_xyz(
+    input  dice_kernel_desc_t kd,
+    input  logic [DICE_CTA_ID_WIDTH-1:0] x,
+    input  logic [DICE_CTA_ID_WIDTH-1:0] y,
+    input  logic [DICE_CTA_ID_WIDTH-1:0] z,
+    output logic [DICE_CTA_ID_WIDTH-1:0] nx,
+    output logic [DICE_CTA_ID_WIDTH-1:0] ny,
+    output logic [DICE_CTA_ID_WIDTH-1:0] nz,
+    output logic                         was_last
   );
-    logic slots_ok = (active_slots < kd.max_cta_per_sm);
-    logic smem_ok  = (smem_used + kd.smem_per_cta <= kd.smem_per_sm);
-    sm_eligible = slots_ok && smem_ok;
+    logic last_x = (x == kd.grid_size.x[DICE_CTA_ID_WIDTH-1:0] - 1);
+    logic last_y = (y == kd.grid_size.y[DICE_CTA_ID_WIDTH-1:0] - 1);
+    logic last_z = (z == kd.grid_size.z[DICE_CTA_ID_WIDTH-1:0] - 1);
+
+    was_last = last_x && last_y && last_z;
+    nx = x; ny = y; nz = z;
+
+    if (!was_last) begin
+      if (!last_x) nx = x + 1;
+      else begin
+        nx = '0;
+        if (!last_y) ny = y + 1;
+        else begin
+          ny = '0;
+          nz = z + 1;
+        end
+      end
+    end
   endfunction
 
-  // ---------------- Pick SM for dispatch ----------------
-  logic                                have_sm;
-  logic [$clog2(N_SM)-1:0]             sel_sm;
+  // --------------------------------------------------------------------
+  // Pick SM for dispatch (needs READY and CREDIT>0)
+  // --------------------------------------------------------------------
+  logic have_sm;
+  logic [$clog2(N_CORES)-1:0] sel_sm;
+
+  int off;  // static (avoid automatic var dump issues)
+  int s;
 
   always_comb begin
     have_sm = 1'b0;
     sel_sm  = '0;
-    for (int unsigned off = 0; off < N_SM; off++) begin
-      int unsigned s = (rr_ptr_q + off) % N_SM;
-      if (sm_eligible(s, kdesc_q, sm_active_cta_q[s], sm_smem_used_q[s])) begin
+
+    for (off = 0; off < N_CORES; off++) begin
+      s = (rr_ptr_q + off) % N_CORES;
+      if ((credit_q[s] != '0) && sm_grant_ready[s]) begin
         have_sm = 1'b1;
-        sel_sm  = s[$bits(sel_sm)-1:0];
+        sel_sm  = s;
         break;
       end
     end
+
+    rr_ptr_d = have_sm ? (sel_sm + 1'b1) : rr_ptr_q;
   end
 
-  // ---------------- Dispatch fire condition ----------------
+  // Dispatch ready condition
   logic dispatch_fire;
-  assign dispatch_fire = kernel_active && (ctas_rem_q != '0) &&
-                         have_sm && sm_grant_ready[sel_sm];
+  assign dispatch_fire = kernel_active && !issued_all_q &&
+                       have_sm && sm_grant_ready[sel_sm];
 
-  // Pre-decode CTA 3D ID for the NEXT CTA
-  logic [CTA_ID_WIDTH-1:0] ctaid_x_dec, ctaid_y_dec, ctaid_z_dec;
+  // --------------------------------------------------------------------
+  // Grant output
+  // --------------------------------------------------------------------
   always_comb begin
-    decode_cta_id(next_cta_q, kdesc_q.grid_x, kdesc_q.grid_y,
-                  ctaid_x_dec, ctaid_y_dec, ctaid_z_dec);
-  end
+    dice_cta_desc_t ctx;
+    ctx.kernel_desc = kdesc_q;
+    ctx.cta_id.x    = cta_x_q;
+    ctx.cta_id.y    = cta_y_q;
+    ctx.cta_id.z    = cta_z_q;
 
-  // Drive 1->N grant bus (one-hot valid + full context)
-  always_comb begin
-    for (int i = 0; i < N_SM; i++) begin
-      sm_grant_valid[i]           = (dispatch_fire && (sel_sm == i));
-
-      sm_grant_ctx[i].kernel_id   = kdesc_q.kernel_id;
-      sm_grant_ctx[i].cta_idx     = next_cta_q;
-
-      sm_grant_ctx[i].grid_x      = kdesc_q.grid_x;
-      sm_grant_ctx[i].grid_y      = kdesc_q.grid_y;
-      sm_grant_ctx[i].grid_z      = kdesc_q.grid_z;
-      sm_grant_ctx[i].block_x     = kdesc_q.block_x;
-      sm_grant_ctx[i].block_y     = kdesc_q.block_y;
-      sm_grant_ctx[i].block_z     = kdesc_q.block_z;
-
-      sm_grant_ctx[i].ctaid_x     = ctaid_x_dec;
-      sm_grant_ctx[i].ctaid_y     = ctaid_y_dec;
-      sm_grant_ctx[i].ctaid_z     = ctaid_z_dec;
-
-      sm_grant_ctx[i].smem_size   = kdesc_q.smem_per_cta;
-      sm_grant_ctx[i].start_pc    = kdesc_q.exec.start_pc;
-      sm_grant_ctx[i].arg_ptr     = kdesc_q.exec.arg_ptr;
+    for (int i = 0; i < N_CORES; i++) begin
+      sm_grant_valid[i] = (kernel_active && have_sm && !issued_all_q && (sel_sm == i));
+      sm_grant_ctx[i]   = ctx;
     end
   end
 
-  // ---------------- N->1 completion RR arbiter ----------------
-  logic                                have_done;
-  logic [$clog2(N_SM)-1:0]             done_sel_sm;
+  // --------------------------------------------------------------------
+  // Completion path — includes CTA ID
+  // --------------------------------------------------------------------
+  logic have_done;
+  logic [$clog2(N_CORES)-1:0] done_sel_sm;
+  dice_cta_id_t done_cta_id_sel;
 
+  int off_1; // static (avoid automatic var dump issues)
+  int s_1;
   always_comb begin
-    have_done   = 1'b0;
-    done_sel_sm = '0;
-    for (int unsigned off = 0; off < N_SM; off++) begin
-      int unsigned s = (done_rr_ptr_q + off) % N_SM;
-      if (sm_done_valid[s]) begin
-        have_done   = 1'b1;
-        done_sel_sm = s[$bits(done_sel_sm)-1:0];
+    have_done       = 1'b0;
+    done_sel_sm     = '0;
+    done_cta_id_sel = '0;
+
+    for (off_1 = 0; off_1 < N_CORES; off_1++) begin
+      s_1 = (done_rr_ptr_q + off_1) % N_CORES;
+      if (sm_done_valid[s_1]) begin
+        have_done       = 1'b1;
+        done_sel_sm     = s_1;
+        done_cta_id_sel = sm_done_cta_id[s_1];
         break;
       end
     end
-  end
 
-  // Ready is one-hot to the selected SM
-  always_comb begin
-    for (int i = 0; i < N_SM; i++) begin
+    for (int i = 0; i < N_CORES; i++) begin
       sm_done_ready[i] = have_done && (done_sel_sm == i);
     end
+
+    done_rr_ptr_d = have_done ? (done_sel_sm + 1'b1) : done_rr_ptr_q;
   end
 
-  // ---------------- State updates ----------------
+  // --------------------------------------------------------------------
+  // State update
+  // --------------------------------------------------------------------
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       kernel_active   <= 1'b0;
       kdesc_q         <= '0;
-      next_cta_q      <= '0;
-      ctas_rem_q      <= '0;
+      cta_x_q         <= '0;
+      cta_y_q         <= '0;
+      cta_z_q         <= '0;
+      issued_all_q    <= 1'b0;
       rr_ptr_q        <= '0;
       done_rr_ptr_q   <= '0;
-      for (int s = 0; s < N_SM; s++) begin
-        sm_active_cta_q[s] <= '0;
-        sm_smem_used_q[s]  <= '0;
+      outstanding_q   <= '0;
+      for (int s = 0; s < N_CORES; s++) begin
+        credit_q[s] <= MAX_CREDITS[CREDIT_W-1:0]; // harmless on reset
       end
+
     end else begin
-      // Accept a new kernel launch when idle
+      // Launch: (re)initialize credits and counters
       if (launch_valid && launch_ready) begin
-        kernel_active <= 1'b1;
-        kdesc_q       <= launch_desc;
-        next_cta_q    <= '0;
-        ctas_rem_q    <= calc_cta_count(launch_desc);
-        rr_ptr_q      <= '0;
-        done_rr_ptr_q <= '0;
-        for (int s = 0; s < N_SM; s++) begin
-          sm_active_cta_q[s] <= '0;
-          sm_smem_used_q[s]  <= '0;
+        kernel_active  <= 1'b1;
+        kdesc_q        <= launch_desc;
+        cta_x_q        <= '0;
+        cta_y_q        <= '0;
+        cta_z_q        <= '0;
+        issued_all_q   <= 1'b0;
+        rr_ptr_q       <= '0;
+        done_rr_ptr_q  <= '0;
+        outstanding_q  <= '0;
+        for (int s = 0; s < N_CORES; s++) begin
+          credit_q[s] <= MAX_CREDITS[CREDIT_W-1:0];
         end
       end
 
-      // Dispatch: consume credits and advance pointers
+      // Dispatch
+      // Dispatch: consume credit and move to next CTA only when handshake completes
       if (dispatch_fire) begin
-        sm_active_cta_q[sel_sm] <= sm_active_cta_q[sel_sm] + 1'b1;
-        sm_smem_used_q [sel_sm] <= sm_smem_used_q [sel_sm] + kdesc_q.smem_per_cta;
-        next_cta_q              <= next_cta_q + 1'b1;
-        ctas_rem_q              <= ctas_rem_q - 1'b1;
-        rr_ptr_q                <= sel_sm + 1'b1;
+        logic [DICE_CTA_ID_WIDTH-1:0] nx, ny, nz;
+        logic was_last;
+        next_cta_xyz(kdesc_q, cta_x_q, cta_y_q, cta_z_q, nx, ny, nz, was_last);
+
+        cta_x_q <= nx;
+        cta_y_q <= ny;
+        cta_z_q <= nz;
+        issued_all_q <= was_last;
+
+        credit_q[sel_sm] <= credit_q[sel_sm] - 1'b1;
+        outstanding_q    <= outstanding_q + 1'b1;
+        rr_ptr_q         <= rr_ptr_d;
       end
 
-      // Completion: return credits (one per cycle via RR arbiter)
+      // Completion — return credit and decrease outstanding
       if (have_done) begin
-        sm_active_cta_q[done_sel_sm] <= sm_active_cta_q[done_sel_sm] - 1'b1;
-        sm_smem_used_q [done_sel_sm] <= sm_smem_used_q [done_sel_sm] -
-                                        sm_done_smem_release[done_sel_sm];
-        done_rr_ptr_q                <= done_sel_sm + 1'b1;
+        if (credit_q[done_sel_sm] != MAX_CREDITS[CREDIT_W-1:0])
+          credit_q[done_sel_sm] <= credit_q[done_sel_sm] + 1'b1;
+        if (dispatch_fire) begin
+          // Special case: dispatch and done in same cycle
+          // Net effect: outstanding unchanged
+          outstanding_q <= outstanding_q;
+        end else if (outstanding_q != '0)
+          outstanding_q <= outstanding_q - 1'b1;
+
+        done_rr_ptr_q <= done_rr_ptr_d;
       end
 
-      // Retire kernel when all CTAs have been granted AND completed
-      if (kernel_active) begin
-        logic any_active;
-        any_active = 1'b0;
-        for (int s = 0; s < N_SM; s++) begin
-          any_active |= (sm_active_cta_q[s] != '0);
-        end
-        if ((ctas_rem_q == '0) && !any_active) begin
-          kernel_active <= 1'b0;
-        end
-      end
+      // Kernel retire when all CTAs have been issued and drained
+      if (kernel_active && issued_all_q && (outstanding_q == '0))
+        kernel_active <= 1'b0;
     end
   end
+
+  // --------------------------------------------------------------------
+  // Optional defensive assertions (simulation only)
+  // --------------------------------------------------------------------
+`ifndef SYNTHESIS
+  // Never dispatch if a core has no credits
+  always_ff @(posedge clk) if (dispatch_fire) begin
+    assert(credit_q[sel_sm] > 0)
+      else $error("Dispatch with zero credit on core %0d", sel_sm);
+  end
+
+  // Credits never exceed MAX_CREDITS
+  generate
+    for (genvar i = 0; i < N_CORES; i++) begin : g_credit_chk
+      always_ff @(posedge clk) begin
+        assert(credit_q[i] <= MAX_CREDITS[CREDIT_W-1:0])
+          else $error("Credit overflow on core %0d", i);
+      end
+    end
+  endgenerate
+`endif
 
 endmodule

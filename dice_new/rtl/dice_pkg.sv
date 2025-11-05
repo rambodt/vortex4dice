@@ -63,6 +63,7 @@ package dice_pkg;
     dice_cta_id_t                cta_id;
   } dice_cta_desc_t; // CTA descriptor passed to CGRA core front end
 
+
 endpackage
 
 `endif // DICE_PKG_VH
