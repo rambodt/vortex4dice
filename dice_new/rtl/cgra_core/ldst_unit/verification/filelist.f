@@ -10,7 +10,7 @@
 # ===========================================
 # Testbench Files
 # ===========================================
-# Interface (must come before package that references it)
+# Interface
 tcu_if.sv
 
 # UVM Package (includes all .svh files)
