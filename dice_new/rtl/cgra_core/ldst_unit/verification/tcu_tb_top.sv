@@ -1,5 +1,6 @@
 `include "uvm_macros.svh"
 import uvm_pkg::*;
+import tcu_pkg::*;
 
 // =============================================================================
 // TOP-LEVEL TESTBENCH
